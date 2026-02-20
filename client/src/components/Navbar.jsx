@@ -40,7 +40,7 @@ const Navbar = () => {
             fontSize: '1.5rem'
           }}
         >
-          Caption Vision
+          IntelliVision
         </Link>
 
         {/* Mobile Toggle */}
