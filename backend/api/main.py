@@ -21,13 +21,14 @@ import collections
 import os
 import shutil
 import time
+import base64
 from datetime import datetime
 from typing import Optional, Tuple
 
 import cv2
 import numpy as np
 from bson import ObjectId
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
@@ -53,7 +54,7 @@ from application_modes.assistive    import AssistiveMode
 from application_modes.self_driving import SelfDrivingMode
 
 # ── Vision Pipeline ──────────────────────────────────────────────────────────
-from vision_engine.pipeline import run_vision_pipeline
+from vision_engine.pipeline import run_vision_pipeline, process_video as pipeline_process_video
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 app = FastAPI(title="Caption-vision API")
@@ -237,6 +238,8 @@ async def upload_image(file: UploadFile = File(...)):
         "scene_description": scene_description,
         "safe_ratio":        pipeline_result["safe_ratio"],
         "timestamp":         timestamp,
+        "type":              "image",
+        "mode":              "surveillance",
     }
     inserted_id = results_collection.insert_one(record).inserted_id
 
@@ -254,6 +257,76 @@ async def upload_image(file: UploadFile = File(...)):
         "free_mask":         pipeline_result["free_mask"],
         "timestamp":         timestamp,
     }
+
+
+# ── /process-video ────────────────────────────────────────────────────────────
+
+@app.post("/process-video")
+async def process_video(
+    file: UploadFile = File(...),
+    mode: str        = Form("surveillance")
+):
+    """
+    Upload a video file, extract metadata, and run vision analysis on a frame.
+    """
+    # 1. Save video file
+    file_path = os.path.join(UPLOAD_DIR, file.filename)
+    try:
+        with open(file_path, "wb") as buf:
+            shutil.copyfileobj(file.file, buf)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not save video: {e}")
+
+    # 2. Process video (Semaphore protected as it uses GPU)
+    if not _LIVE_LOCK.locked():
+        await _LIVE_LOCK.acquire()
+    else:
+        # In case of 503, we should probably delete the file or just return
+        raise HTTPException(status_code=503, detail="Server busy — retry in a moment")
+
+    try:
+        # 3. Call video processing helper
+        result = await pipeline_process_video(file_path, mode=mode)
+        
+        if "error" in result:
+            raise HTTPException(status_code=400, detail=result["error"])
+
+        # 4. Persistence (Similar to /upload but for multiple frames)
+        timestamp = datetime.now().isoformat()
+        
+        record = {
+            "file_path":         file_path,
+            "metadata":          result["metadata"],
+            "frame_summaries":   result["frame_summaries"],
+            "aggregated_stats":  result["aggregated_stats"],
+            "scene_description": result["aggregated_stats"]["video_summary"],
+            "timestamp":         timestamp,
+            "type":              "video",
+            "mode":              mode,
+        }
+        inserted_id = results_collection.insert_one(record).inserted_id
+
+        # 5. Clean and structure response (User requirement: no raw frames)
+        frame_summaries = result.get("frame_summaries", [])
+        for f in frame_summaries:
+            f.pop("raw_frame_b64", None)
+            
+        agg = result.get("aggregated_stats", {})
+        
+        return {
+            "mode":                  mode,
+            "total_frames_analyzed": agg.get("total_frames_analyzed", 0),
+            "total_processing_ms":   result.get("metadata", {}).get("total_processing_ms", 0),
+            "frame_summaries":       frame_summaries,
+            "object_counts":         agg.get("object_counts", {}),
+            "video_summary":         agg.get("video_summary", "")
+        }
+
+    except Exception as e:
+        print(f"[api] /process-video error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        _LIVE_LOCK.release()
 
 
 # ── /analyze-frame ─────────────────────────────────────────────────────────────
@@ -529,3 +602,169 @@ def delete_result(id: str):
         return {"message": "Record not found"}
     except Exception as e:
         return {"message": "Invalid ID format", "error": str(e)}
+
+
+# ── WebSocket: Live Captioning ───────────────────────────────────────────────
+
+class RollingCaptionTracker:
+    """
+    Stabilizes live narrations by tracking recent frame history.
+    - Limits redundancy (no repeating identical sentences).
+    - Merges detections (detecting continuous movement).
+    - Maintains a window of the last 5 frames.
+    """
+    def __init__(self, window_size: int = 5):
+        self.history = collections.deque(maxlen=window_size)
+        self.last_sent_summary = ""
+
+    def process(self, current_summary: str, detections: list) -> str:
+        # 1. Clean and store
+        current_summary = current_summary.strip()
+        self.history.append({
+            "summary": current_summary,
+            "detections": [d["label"] for d in detections]
+        })
+
+        # 2. Deduplication: If identical to last frame, return a stable status
+        if current_summary == self.last_sent_summary:
+            # Check if this has happened for a while
+            if all(h["summary"] == current_summary for h in self.history):
+                return "The scene remains stable."
+            return self.last_sent_summary
+
+        # 3. Event Merging: Check for continuous movement of common objects
+        # Get count of objects in history window
+        labels_across_history = []
+        for h in self.history:
+            labels_across_history.extend(h["detections"])
+        
+        counts = collections.Counter(labels_across_history)
+        
+        # If an object appears in almost every frame of the window
+        # we can describe it as "continuous"
+        continuous_events = []
+        for label, count in counts.items():
+            if count >= 3: # Appeared in 3 out of 5 frames
+                continuous_events.append(label)
+        
+        if continuous_events:
+            event_text = ", ".join(continuous_events[:2])
+            merged_caption = f"Continuous {event_text} movement detected. {current_summary}"
+            self.last_sent_summary = current_summary
+            return merged_caption
+
+        self.last_sent_summary = current_summary
+        return current_summary
+
+
+@app.websocket("/ws/live-caption")
+async def websocket_live_caption(websocket: WebSocket):
+    """
+    Persistent WebSocket for ultra-low latency live camera analysis.
+    Supports JSON: { "frame": "base64...", "mode": "surveillance|assistive" }
+    """
+    await websocket.accept()
+    print("[ws] Live captioning client connected")
+    
+    last_processed_time = 0.0
+    PROCESS_INTERVAL = 2.0  # Seconds between processing frames
+    tracker = RollingCaptionTracker(window_size=5) # Per-connection state
+    
+    try:
+        while True:
+            # 1. Receive JSON message
+            try:
+                msg = await websocket.receive_json()
+                frame_b64 = msg.get("frame")
+                mode = msg.get("mode", "assistive")
+            except Exception:
+                # Fallback to legacy raw string if JSON fails
+                raw_data = await websocket.receive_text()
+                frame_b64 = raw_data
+                mode = "assistive"
+
+            if not frame_b64:
+                continue
+
+            try:
+                raw_bytes = base64.b64decode(frame_b64)
+            except Exception:
+                await websocket.send_json({"error": "Invalid base64 encoding"})
+                continue
+
+            # 2. Rate Control
+            now = time.perf_counter()
+            if now - last_processed_time < PROCESS_INTERVAL:
+                continue
+
+            # 3. Semaphore Lock
+            if _LIVE_LOCK.locked():
+                continue
+
+            async with _LIVE_LOCK:
+                last_processed_time = now
+                t_start = time.perf_counter()
+                
+                img_bgr, img_rgb, h, w = await asyncio.to_thread(
+                    _decode_and_resize, raw_bytes, 640
+                )
+                if img_bgr is None:
+                    await websocket.send_json({"error": "Decode failed"})
+                    continue
+
+                # 4. Run Vision Pipeline (Client-specified mode)
+                pipeline_result = await run_vision_pipeline(
+                    img_rgb, 
+                    mode=mode, 
+                    run_caption=True,
+                    is_live=True
+                )
+                
+                # 5. Stabilization
+                stable_summary = tracker.process(
+                    pipeline_result["scene_description"], 
+                    pipeline_result["detections"]
+                )
+                
+                total_ms = round((time.perf_counter() - t_start) * 1000, 1)
+                perf = _perf.record(total_ms, label="ws/live")
+
+                # 6. Surveillance Persistence (User requirement)
+                if mode == "surveillance":
+                    timestamp = datetime.now().isoformat()
+                    # Generate unique filename
+                    filename = f"live_{int(time.time())}.jpg"
+                    save_path = os.path.join(UPLOAD_DIR, filename)
+                    cv2.imwrite(save_path, img_bgr)
+                    
+                    record = {
+                        "file_path":         save_path,
+                        "detections":        pipeline_result["detections"],
+                        "scene_description": pipeline_result["scene_description"],
+                        "timestamp":         timestamp,
+                        "type":              "image",
+                        "mode":              "surveillance",
+                        "is_live_capture":   True
+                    }
+                    results_collection.insert_one(record)
+
+                # 7. Send Result
+                await websocket.send_json({
+                    "summary":           stable_summary,
+                    "detections":        pipeline_result["detections"],
+                    "navigation":        pipeline_result["navigation"],
+                    "safe_ratio":        pipeline_result["safe_ratio"],
+                    "timing_ms":         {
+                        "total_ms": total_ms,
+                        "avg_fps":  perf["avg_fps"],
+                        **pipeline_result["timing"]
+                    },
+                    "timestamp": datetime.now().isoformat()
+                })
+
+    except WebSocketDisconnect:
+        print("[ws] Live captioning client disconnected")
+    except Exception as e:
+        print(f"[ws] Unexpected error: {e}")
+        try: await websocket.close()
+        except: pass

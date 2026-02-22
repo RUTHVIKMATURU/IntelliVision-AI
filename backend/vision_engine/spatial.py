@@ -245,6 +245,7 @@ def generate_scene_description(
     detections: list,
     navigation: str,
     caption:    str,
+    mode:       str = "assistive",
 ) -> str:
     """
     Single plain-English paragraph combining caption, top-4 detections
@@ -267,9 +268,11 @@ def generate_scene_description(
     for det in sorted_dets[:4]:
         parts.append(_object_sentence(det))
 
-    nav_text = _NAV_PHRASE.get(navigation, "")
-    if nav_text:
-        parts.append(nav_text)
+    # Skip navigation for surveillance mode (monitoring only)
+    if mode != "surveillance":
+        nav_text = _NAV_PHRASE.get(navigation, "")
+        if nav_text:
+            parts.append(nav_text)
 
     if not detections and not nav_text:
         parts.append("No significant objects detected. The scene appears clear.")
@@ -353,3 +356,74 @@ def generate_assistive_caption(detections: list, caption: str = "") -> str:
         parts.append("The current view appears to be clear.")
 
     return " ".join(parts)
+def generate_video_summary(aggregated_data: dict, mode: str) -> str:
+    """
+    Generate a high-quality, professional summary of the entire video analysis.
+    Synthesizes object frequencies and categories into a coherent narrative.
+    """
+    counts = aggregated_data.get("object_counts", {})
+    if not counts:
+        return "No significant activity or objects were detected throughout the video recording."
+
+    # Grouping categories
+    vehicles = {k: v for k, v in counts.items() if k in ["car", "motorcycle", "bus", "truck", "bicycle"]}
+    living = {k: v for k, v in counts.items() if k in ["person", "dog", "cat", "horse", "cow"]}
+    infrastructure = {k: v for k, v in counts.items() if k in ["traffic light", "stop sign", "fire hydrant"]}
+    
+    total_vehicles = sum(vehicles.values())
+    total_living = sum(living.values())
+    
+    def get_intensity(count):
+        if count == 0: return None
+        if count < 5:  return "low"
+        if count < 15: return "moderate"
+        return "high"
+
+    v_intensity = get_intensity(total_vehicles)
+    l_intensity = get_intensity(total_living)
+
+    narrative_parts = []
+
+    if mode == "surveillance":
+        if total_living > 0:
+            narrative_parts.append(f"{l_intensity} levels of pedestrian or living activity")
+        if total_vehicles > 0:
+            narrative_parts.append(f"{v_intensity} vehicle presence")
+        
+        if not narrative_parts:
+            return "The surveillance footage shows a stable environment with no significant movement or object detections."
+        
+        summary = "The recording captures " + " and ".join(narrative_parts) + "."
+        if infrastructure:
+            summary += f" Fixed infrastructure like {', '.join(infrastructure.keys())} was also identified."
+        return summary
+
+    elif mode == "assistive":
+        main_focus = []
+        if "person" in counts: main_focus.append("pedestrians")
+        if total_vehicles > 0: main_focus.append("moving vehicles")
+        
+        if not main_focus:
+            return "The path appears largely clear of major dynamic obstacles."
+        
+        summary = "The environment contains " + " and ".join(main_focus)
+        summary += f" with a total of {len(counts)} distinct object types identified across the timeline."
+        return summary + "."
+
+    elif mode == "self_driving":
+        status = "clear"
+        if total_vehicles > 20: status = "heavy traffic"
+        elif total_vehicles > 8: status = "moderate traffic"
+        
+        road_objs = [k for k in counts.keys() if k in ["traffic light", "stop sign"]]
+        msg = f"Analysis indicates {status} conditions."
+        if road_objs:
+            msg += f" Key markers identified: {', '.join(road_objs)}."
+        return msg
+
+    # Fallback
+    top_3 = aggregated_data.get("most_frequent_objects", [])
+    if top_3:
+        return f"Video analysis complete. Primary subjects identified include {', '.join(top_3)}."
+    
+    return "The video has been analyzed, revealing a standard environmental scene."

@@ -21,7 +21,7 @@ const formatTimestamp = (ts) => {
 
 const getImageUrl = (url) => {
   if (!url) return '';
-  if (url.startsWith('http') || url.startsWith('blob:')) return url;
+  if (url.startsWith('http') || url.startsWith('blob:') || url.startsWith('data:')) return url;
   const cleaned = url.replace(/\\/g, '/').replace(/^\//, '');
   return `http://localhost:8000/${cleaned}`;
 };
@@ -45,15 +45,36 @@ const HistoryCard = ({ item, onDelete }) => {
       className="card border-secondary h-100 shadow-sm"
       style={{ backgroundColor: 'rgba(22,26,31,0.96)', overflow: 'hidden' }}
     >
-      {/* ── Image thumbnail ───────────────────────── */}
-      <div className="position-relative" style={{ height: 180 }}>
-        <img
-          src={getImageUrl(item.file_path || item.imageUrl)}
-          className="w-100 h-100"
-          style={{ objectFit: 'cover' }}
-          alt="Analysed frame"
-          onError={e => { e.currentTarget.style.display = 'none'; }}
-        />
+      {/* ── Visual Media ─────────────────────────── */}
+      <div className="position-relative bg-black" style={{ height: 180 }}>
+        {item.type === 'video' ? (
+          <video
+            src={getImageUrl(item.file_path)}
+            className="w-100 h-100"
+            style={{ objectFit: 'cover' }}
+            muted
+            loop
+            onMouseEnter={e => e.currentTarget.play()}
+            onMouseLeave={e => { e.currentTarget.pause(); e.currentTarget.currentTime = 0; }}
+          />
+        ) : (
+          <img
+            src={getImageUrl(item.file_path || item.imageUrl)}
+            className="w-100 h-100"
+            style={{ objectFit: 'cover' }}
+            alt="Analysed frame"
+            onError={e => { e.currentTarget.style.display = 'none'; }}
+          />
+        )}
+
+        {/* Type Icon Overlay */}
+        <div className="position-absolute top-0 start-0 p-2">
+          <span className="badge bg-dark bg-opacity-75 border border-secondary shadow-sm">
+            <i className={`bi ${item.type === 'video' ? 'bi-camera-reels-fill' : 'bi-image-fill'} me-1`} />
+            {item.type === 'video' ? 'Video' : 'Image'}
+          </span>
+        </div>
+
         {/* Gradient overlay */}
         <div className="position-absolute bottom-0 start-0 w-100 px-3 py-2"
           style={{ background: 'linear-gradient(to top,rgba(0,0,0,0.85),transparent)' }}>
@@ -69,7 +90,7 @@ const HistoryCard = ({ item, onDelete }) => {
               )}
               {hasObjects && (
                 <span className="badge bg-secondary bg-opacity-75" style={{ fontSize: '0.62rem' }}>
-                  {detections.length} objects
+                  {detections.length || (item.aggregated_stats?.total_frames_analyzed + ' f')} {detections.length > 0 ? 'objects' : ''}
                 </span>
               )}
             </div>
@@ -78,17 +99,53 @@ const HistoryCard = ({ item, onDelete }) => {
       </div>
 
       <div className="card-body d-flex flex-column gap-3 p-3">
+        {/* ── Main Caption ─────────────────────────── */}
+        <div className="p-2 px-3 rounded-3 border border-secondary"
+          style={{ background: 'rgba(14,165,233,0.06)' }}>
+          <p className="text-info fw-bold text-uppercase mb-1" style={{ fontSize: '0.62rem', letterSpacing: '0.05em' }}>
+            <i className="bi bi-stars me-1" />AI Caption
+          </p>
+          <p className="text-white mb-0" style={{ fontSize: '0.82rem', lineHeight: 1.45 }}>
+            {item.caption || item.scene_description || item.summary || 'No description available.'}
+          </p>
+        </div>
 
-        {/* ── AI Summary ────────────────────────────── */}
-        {item.scene_description && (
-          <div className="p-2 px-3 rounded-3 border border-secondary"
-            style={{ background: 'rgba(14,165,233,0.06)' }}>
-            <p className="text-info fw-bold text-uppercase mb-1" style={{ fontSize: '0.62rem', letterSpacing: '0.05em' }}>
-              <i className="bi bi-stars me-1" />Summary
-            </p>
-            <p className="text-light mb-0" style={{ fontSize: '0.82rem', lineHeight: 1.45 }}>
-              {item.scene_description}
-            </p>
+
+        {/* ── Video Event Timeline ───────────────────── */}
+        {item.type === 'video' && item.frame_summaries?.length > 0 && (
+          <div className="px-3 pb-3">
+            <button
+              className="btn btn-link text-info text-decoration-none p-0 mb-2 d-flex align-items-center gap-1"
+              style={{ fontSize: '0.72rem', letterSpacing: '0.05em' }}
+              onClick={() => setExpanded(e => !e)}
+            >
+              <i className={`bi bi-chevron-${expanded ? 'up' : 'down'}`} />
+              <span className="text-uppercase fw-bold">
+                <i className="bi bi-clock-history me-1" />
+                View {item.frame_summaries.length} Frame Captions
+              </span>
+            </button>
+
+            <AnimatePresence>
+              {expanded && (
+                <motion.div
+                  initial={{ opacity: 0, height: 0 }}
+                  animate={{ opacity: 1, height: 'auto' }}
+                  exit={{ opacity: 0, height: 0 }}
+                  transition={{ duration: 0.22 }}
+                  className="overflow-hidden"
+                >
+                  <div className="d-flex flex-column gap-2 border-start border-secondary border-opacity-25 ms-1 ps-2">
+                    {item.frame_summaries.map((f, i) => (
+                      <div key={i} className="mb-1">
+                        <span className="badge bg-secondary-subtle text-secondary me-2" style={{ fontSize: '0.6rem' }}>{f.timestamp_sec}s</span>
+                        <span className="text-white small opacity-75" style={{ fontSize: '0.75rem' }}>{f.caption || f.summary}</span>
+                      </div>
+                    ))}
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
           </div>
         )}
 
@@ -215,12 +272,12 @@ const History = () => {
       >
         {/* Header */}
         <div className="d-flex justify-content-between align-items-center mb-4 flex-wrap gap-2">
-          <h2 className="display-6 fw-bold mb-0" style={{
-            background: 'linear-gradient(135deg,#a78bfa,#e879f9)',
-            WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent'
+          <h2 className="display-6 fw-bold mb-0 d-flex align-items-center gap-2" style={{
+            color: '#a78bfa',
+            textShadow: '0 2px 15px rgba(0,0,0,0.4)',
           }}>
-            <i className="bi bi-clock-history me-2" style={{ WebkitTextFillColor: '#a78bfa' }} />
-            Analysis History
+            <i className="bi bi-clock-history" />
+            <span>Analysis History</span>
           </h2>
           {!isLoading && (
             <span className="badge bg-secondary text-light">
